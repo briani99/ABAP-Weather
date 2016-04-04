@@ -1,0 +1,247 @@
+*&---------------------------------------------------------------------*
+*& Function Module  ZBK_WEATHER_METRICS
+*&
+*& TITLE: Weather metrics
+*&
+*& CREATED ON: 06 Aug 2014
+*& CREATED BY: Brian Keenan
+*& DESCRIPTION: Returns weather metric to Solution manager via EFWK.
+*&              At the moment just temperature depending on city entered.
+
+*&---------------------------------------------------------------------*
+
+FUNCTION ZBK_WEATHER_METRICS.
+*"----------------------------------------------------------------------
+*"*"Local Interface:
+*"  IMPORTING
+*"     REFERENCE(SELOPT_PARA) TYPE  E2E_SELECTION_PARA_T
+*"  EXPORTING
+*"     REFERENCE(RESULT) TYPE  E2E_RESULT_TT
+*"     REFERENCE(RETURN_STATUS) TYPE  E2E_EFWKE_RETURN_STATUS_T
+*"----------------------------------------------------------------------
+DATA: li_client TYPE REF TO if_http_client,
+           lv_msg TYPE string,
+           lv_string TYPE string,
+           lv_status_code TYPE i,
+           lv_xstring TYPE xstring.
+
+ DATA: lv_url TYPE string,
+        lv_uri TYPE string,
+        lt_param TYPE /sdf/e2e_para_tt,
+        ls_selopt_para LIKE LINE OF selopt_para.
+
+DATA:
+  lt_selopt_para LIKE selopt_para,
+  ls_parameter TYPE /sdf/e2e_para,
+  ls_result TYPE /sdf/e2e_result,
+  lt_sel_opt_city TYPE /sdf/e2e_selop_tt,
+  ls_return_status LIKE LINE OF return_status,
+
+  lv_city TYPE string,
+  lv_callid TYPE INT4.
+
+FIELD-SYMBOLS:
+               <ls_selopt_para> TYPE /sdf/e2e_selection_para,
+               <ls_selection_parameter> TYPE /sdf/e2e_selection_params,
+               <ls_sel_opt> TYPE /sdf/ranges.
+
+
+*& Look at the selection parameters to check which city is called.
+
+LOOP AT selopt_para ASSIGNING <ls_selopt_para>. "Loop over all CALL_ID
+* Retrieve parameter values from the metric configuration
+  LOOP AT <ls_selopt_para>-selection_parameter ASSIGNING <ls_selection_parameter>.
+    CASE <ls_selection_parameter>-param.
+        WHEN 'CITY'.
+          CLEAR lv_city.
+          lt_sel_opt_city = <ls_selection_parameter>-t_ranges.
+          READ TABLE lt_sel_opt_city ASSIGNING <ls_sel_opt> INDEX 1.
+
+          lv_city = <ls_sel_opt>-low.
+
+          IF lv_city IS INITIAL.
+*Set error to export parameter RETURN_STATUS
+              ls_return_status-call_id = <ls_selopt_para>-call_id.
+              ls_return_status-status = 10.
+              ls_return_status-msgtext = 'A city needs to be selected'. "#EC NOTEXT
+              APPEND ls_return_status TO return_status.
+              EXIT.
+          ENDIF.
+       WHEN OTHERS.
+    ENDCASE.
+  ENDLOOP.
+
+
+
+  lv_url = 'http://api.worldweatheronline.com/free/v1/weather.ashx'.
+  lv_url = lv_url && '?q=' && <ls_sel_opt>-low && '&format=xml'.
+  lv_url = lv_url && '&key=b0b0531f91026b3507dd3d6e55a3b0f428a3ca42'.
+
+
+  cl_http_client=>create_by_url(
+       EXPORTING
+         url                = lv_url
+         proxy_host         = 'proxy'
+         proxy_service      = '8080'
+       IMPORTING
+         client             =   li_client  " HTTP Client Abstraction
+       EXCEPTIONS
+         argument_not_found = 1
+         plugin_not_active  = 2
+         internal_error     = 3
+         OTHERS             = 4
+     ).
+  IF sy-subrc <> 0.
+
+  ENDIF.
+
+  li_client->request->set_method( if_http_request=>co_request_method_get  ).
+  li_client->request->set_version( if_http_request=>co_protocol_version_1_1 ).
+
+  li_client->send(
+        EXPORTING
+          timeout                    = if_http_client=>co_timeout_default    " Timeout of Answer Waiting Time
+        EXCEPTIONS
+          http_communication_failure = 1
+          http_invalid_state         = 2
+          http_processing_failed     = 3
+          http_invalid_timeout       = 4
+          OTHERS                     = 5
+      ).
+  IF sy-subrc <> 0.
+    li_client->get_last_error( IMPORTING message = lv_string ).
+
+  ELSE.
+    li_client->receive(
+    EXCEPTIONS
+      http_communication_failure = 1
+      http_invalid_state         = 2
+      http_processing_failed     = 3
+      OTHERS                     = 4
+  ).
+    IF sy-subrc <> 0.
+      li_client->get_last_error( IMPORTING message = lv_string ).
+
+    ELSE.
+      li_client->response->get_status( IMPORTING code = lv_status_code ).
+      lv_xstring = li_client->response->get_data( ).
+
+      lv_callid = <ls_selopt_para>-call_id.
+
+      PERFORM get_values USING lv_xstring CHANGING lt_param.
+      PERFORM get_result USING lt_param lv_city lv_callid CHANGING result.
+    ENDIF.
+  ENDIF.
+  li_client->close( ).
+ENDLOOP.
+ENDFUNCTION.
+
+****************************************************************************
+
+Include          LZBRIANF01
+
+
+FORM get_values  USING    p_lv_xstring TYPE xstring
+                 CHANGING p_lt_param TYPE /sdf/e2e_para_tt.
+  TYPE-POOLS: ixml.
+  DATA: node TYPE REF TO if_ixml_node,
+        node_name TYPE string,
+        el TYPE string,
+        str TYPE string,
+        event_sub TYPE i.
+  DATA g_ixml TYPE REF TO if_ixml .
+  DATA streamfactory TYPE REF TO if_ixml_stream_factory .
+  DATA istream TYPE REF TO if_ixml_istream .
+  DATA document TYPE REF TO if_ixml_document .
+  DATA parser TYPE REF TO if_ixml_parser .
+  DATA event TYPE REF TO if_ixml_event .
+  DATA: children      TYPE REF TO if_ixml_node_list,
+        child         TYPE REF TO if_ixml_node,
+        parent_node   TYPE REF TO if_ixml_node,
+        child_iterator TYPE REF TO if_ixml_node_iterator.
+
+  DATA: ls_param LIKE LINE OF p_lt_param.
+
+  g_ixml        = cl_ixml=>create( ).
+  streamfactory = g_ixml->create_stream_factory( ).
+  istream       = streamfactory->create_istream_xstring( p_lv_xstring ).
+  document      = g_ixml->create_document( ).
+
+  parser        = g_ixml->create_parser( stream_factory = streamfactory
+                                         istream        = istream
+                                         document       = document ).
+
+  event_sub = "if_ixml_event=>co_event_element_pre +
+            "if_ixml_event=>co_event_element_pre2 +
+            if_ixml_event=>co_event_element_post.
+  parser->set_event_subscription( events = event_sub ).
+
+  DO.
+
+    event = parser->parse_event( ).
+    IF event IS INITIAL.
+      EXIT. " either end reached or error (check below)
+    ENDIF.
+    CASE event->get_type( ).
+      WHEN if_ixml_event=>co_event_element_post.
+        el = event->get_name( ).
+        IF  el = 'temp_C'.
+          ls_param-param = 'temperature'.
+          ls_param-value = event->get_value( ).
+          APPEND ls_param TO p_lt_param.
+        ELSEIF el = 'observation_time'.
+          ls_param-param = 'time'.
+          ls_param-value = event->get_value( ).
+          APPEND ls_param TO p_lt_param.
+
+        ENDIF.
+
+    ENDCASE.
+  ENDDO.
+
+
+ENDFORM.                    " GET_VALUES
+*&---------------------------------------------------------------------*
+*&      Form  GET_RESULT
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->P_LT_PARAM  text
+*      <--P_RESULT  text
+*----------------------------------------------------------------------*
+FORM get_result  USING    p_lt_param TYPE /sdf/e2e_para_tt
+                          p_city TYPE string
+                          p_callid TYPE INT4
+                 CHANGING p_result TYPE e2e_result_tt.
+  DATA: ls_param LIKE LINE OF p_lt_param,
+        ls_result LIKE LINE OF p_result.
+
+  DATA: ls_selection TYPE E2E_PARA_S.
+
+
+
+  LOOP AT p_lt_param INTO ls_param.
+
+    IF ls_param-param  = 'temperature'.
+      ls_result-result-count = 1.
+      ls_result-result-max = ls_param-value.
+      ls_result-result-min = ls_param-value.
+      ls_result-result-sum = ls_param-value.
+      ls_result-result-average = ls_param-value.
+    ELSEIF ls_param-param  = 'time'.
+      ls_result-result-text = ls_param-value.
+    ENDIF.
+  ENDLOOP.
+
+  ls_result-call_id = p_callid.
+
+  ls_selection-param = 'CITY'.
+  ls_selection-value = p_city.
+
+  APPEND ls_selection TO ls_result-result-t_parameter.
+
+
+
+  APPEND ls_result TO p_result.
+
+ENDFORM.           
